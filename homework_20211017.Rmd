@@ -1,0 +1,150 @@
+---
+title: "homework_20211017"
+author: "Ivan Aguilar"
+output: html_document
+---
+In this lab we have implemented LASSO for Gaussian linear regression but LASSO can also be used for GLMs. In this homework, you will implement LASSO for logistic regression (GLM for Bernoulli response) on the spam dataset with `glmnet`. Check `help("glmnet")` and the package vignette for further information.
+
+The spam dataset consists of information from 4601 email messages, in a study to try to predict whether the email was junk email, or “spam.” The objective was to design an automatic spam detector that could filter out spam before clogging the users’ mailboxes. For all 4601 email messages, the true outcome (email type) email or spam is available, along with the relative frequencies of 57 of the most commonly occurring words and punctuation marks in the email message.
+
+The file `spam.info.txt` contains information about the dataset, `spambase.names` the names of the variables  and `spam.data` the actual data. The last column of `spam.data` denotes whether the e-mail was 
+considered spam (1) or not (0). The data can be loaded with the following code:
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(message= FALSE, warning = FALSE)
+```
+## Import libraries
+
+```{r, message=FALSE}
+PATH= '/home/ivanobat/gitrepos/StatModInf/StatInference_seminar1'
+library(hdm)
+library(glmnet)
+library(ggplot2)
+library(tidyverse)
+library(HDCI)
+library(gridExtra)
+library(caret)
+library(klaR)
+source(file.path(PATH,"routines_homework.R"))
+```
+
+## Loading data
+```{r}
+spam <- read.table(file.path(PATH, 'data/spam.data'), quote="\"", comment.char="")
+spam.names <- c(read.table("data/spambase.names", sep = ":", skip = 33, nrows = 53, as.is = TRUE)[,
+                            1], "char_freq_#", read.table("data/spambase.names", sep = ":", skip = 87, nrows = 3, as.is = TRUE)[, 1], "spam.01")
+names(spam) <- spam.names
+dim(spam)
+```
+## Homework description
+Compare MLE, LASSO-CV and LASSO-BIC estimates in a 1 page report indicating the number of selected variables and 10-fold cross-validated $R^2$ for each of these 3 methods. Include the R code you used and a discussion on the following question: if you were asked to choose one of these methods to obtain results for your applied research paper, which one would you pick, and why?
+
+## First look at the data and clean up some headers
+```{r}
+xdf <- spam
+dim(xdf)
+
+#Clean up some bad header names
+names(spam)[names(spam) == "char_freq_["] <- "char_freq_cor"
+names(spam)[names(spam) == "char_freq_!"] <- "char_freq_exc"
+names(spam)[names(spam) == "char_freq_("] <- "char_freq_par"
+names(spam)[names(spam) == "char_freq_;"] <- "char_freq_sem"
+names(spam)[names(spam) == "char_freq_$"] <- "char_freq_dol"
+names(spam)[names(spam) == "char_freq_#"] <- "char_freq_amp"
+
+factors <- as.formula(paste("~",paste(names(spam)[1:57], collapse=" + ")))
+```
+```{r}
+head(xdf)
+```
+## Create the design matrix
+```{r}
+y<- spam$spam.01
+x<- model.matrix( factors, data=spam)[,-1]
+```
+## MLE
+```{r}
+fit.mle= glm(y ~ x, family = 'binomial') 
+b.mle= coef(fit.mle)
+summary(fit.mle)
+```
+
+```{r}
+sum(b.mle[c(-1)]!=0)
+```
+## MLE pseudo r-squared
+```{r}
+cv.mle= kfoldCV.glm(y=y,x=data.frame(x), K=10, seed=1, family='binomial', predict_type = 'response')
+result.cv.mle = ifelse(cv.mle$pred>.5,1,0)
+r2.mle2 =  1 - (sum((y-result.cv.mle)^2)/sum((y - mean(y))^2))
+r2.mle2
+```
+# MLE error matrix
+```{r}
+errormatrix(y, result.cv.mle)
+```
+
+## LASSO CV
+```{r}
+fit.lasso= cv.glmnet(x=x, y=y, nfolds=10)
+fit.lasso
+```
+
+```{r}
+b.lasso= as.vector(coef(fit.lasso, s='lambda.min'))
+round(b.lasso, 3)
+```
+
+```{r}
+#Create a logical mask for when the coefficients are not zero
+nonzerob= b.lasso[c(-1)]!= 0
+nonzerob_count= sum(nonzerob)
+nonzerob_count
+```
+```{r}
+nonzerobnames=(colnames(x))[nonzerob]
+nonzerobnames
+```
+## LASSO CV pseudo r-squared
+```{r}
+cv.lasso= kfoldCV.lasso.glm(y=y,x=x,K=10, seed=1,criterion="cv", family = 'binomial', predict_type = 'response')
+result.cv.lasso= ifelse(cv.lasso$pred>.5,1,0)
+r2.lassocv =  1 - (sum((y-result.cv.lasso)^2)/sum((y - mean(y))^2))
+r2.lassocv
+```
+
+```{r}
+errormatrix(y, result.cv.lasso)
+```
+
+## LASSO BIC
+```{r}
+fit.lassobic= lasso.bic.glm(y=y,x=x,extended = FALSE, family = 'binomial')
+b.lassobic= as.vector(fit.lassobic$coef)
+```
+
+```{r}
+round(b.lassobic,3)
+```
+```{r}
+nonzerob= b.lassobic[c(-1)]!= 0
+nonzerob_count= sum(nonzerob)
+nonzerob_count
+```
+```{r}
+nonzerob=(colnames(x))[nonzerob]
+nonzerob
+```
+
+## LASSO BIC pseudo r-squared
+```{r}
+cv.lassobic= kfoldCV.lasso.glm(y=y,x=x,K=10, seed=1,criterion="bic", family = 'binomial', predict_type = 'response')
+result.cv.lassobic= ifelse(cv.lassobic$pred>.5,1,0)
+r2.cv.lassobic =  1 - (sum((y-result.cv.lassobic)^2)/sum((y - mean(y))^2))
+r2.cv.lassobic
+```
+## LASSO BIC error matrix
+```{r}
+errormatrix(y, result.cv.lassobic)
+```

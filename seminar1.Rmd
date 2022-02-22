@@ -1,0 +1,686 @@
+---
+title: "Statistical Modelling and Inference - Seminar 1"
+author: "David Rossell and Paul Rognon"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r}
+rm(list=ls())
+knitr::opts_chunk$set(message= FALSE, warning = FALSE)
+```
+
+We analyze dataset `cps2012` (R package [hdm](https://cran.r-project.org/web/packages/hdm/index.html)) from a 2012 USA census on wages. FyI the package provides methods to analyze high-dimensional data, in particular to estimate treatment effects in the presence of many confounders, see the [tutorial](https://cran.r-project.org/web/packages/hdm/vignettes/hdm.pdf).
+
+The data contains log-hourly wages, gender, marital status, education, geographic information and several measures of job experience.
+Type `help("cps2012")` for details. We want to study imbalances between female and male workers, adjusting for other variables such as experience.
+
+Section 1 describes how to import the data. Sections 2-5 assess predictions and variable selection for several penalized likelihood methods. Section 6 attempts to assess statistical significance.
+
+```{r, message=FALSE}
+PATH= '/home/ivanobat/StatModelsInference/StatInference_seminar1'
+library(hdm)
+library(glmnet)
+library(ggplot2)
+library(tidyverse)
+library(HDCI)
+library(gridExtra)
+source(file.path(PATH,"routines_seminar1.R"))
+```
+
+
+# Data formatting, exploratory analysis
+
+We load a data.frame `salary` that contains a pre-processed version of the data where categorical predictors are stored as factors. We check the dimensions of the dataset and first rows.
+
+```{r}
+load(file.path(PATH, 'data/salary.RData'))
+xdf= salary
+dim(xdf)
+head(xdf)
+```
+We then create a numeric design matrix `x` where categories are indicated by dummy variables 
+and that contains pairwise interactions between all predictors. This gives a total of 77 columns in the design matrix.
+
+```{r}
+y= salary$lnw
+x= model.matrix(~ female + marital + edu + region + exp1 +
+ female:marital + female:edu + female:region + female:exp1
+ + marital:edu + marital:region + marital:exp1 + edu:region + edu:exp1 + region:exp1, data=salary)
+dim(x)
+head(x[,1:20]) #show first rows for 20 first columns
+```
+We produce a scatterplot for `y` vs `exp1`, indicating females and males in different colors. We then fit a regression model via least squares (function `geom_smooth(method='lm')`), separately for females and males, and add both regression lines to the plot.
+
+```{r,message=FALSE}
+col <- ifelse(x[,"female"]==1,'female','male')
+ggplot(xdf,aes(x=exp1,y=lnw,col=col)) + geom_point(size=0.5) + geom_smooth(method='lm') + xlab('experience (standardized)') + ylab('log hourly wage')+ theme_classic() + theme(legend.position = 'bottom') 
+```
+
+
+Let's try a slightly more advanced exploratory data analysis. We discretize the years of experience into 5-year intervals using `cut`, and then compute the average log-salary for each (experience, gender) group using function `tapply`.
+
+
+```{r}
+expgroups= cut(xdf$exp1,breaks=seq(-2.5,3.5,by=0.5))
+edugroup= as.character(xdf$edu); edugroup[edugroup=='hsg' | edugroup=='hsd']= 'hsd or hsg'
+m= tapply(exp(xdf$lnw), list(expgroups,xdf$female,edugroup), 'mean')
+```
+
+We create a plot with 2 rows and 2 columns. Note the use of `points` to add points to an existing plot, and `legend` to add a legend.
+
+```{r}
+ylim= c(0,8)
+elevels= seq(-2,3.5,by=0.5)
+
+par(mfrow=c(2,2), mar=c(4,4,1,0))
+plot(elevels,m[,1,'hsd or hsg'],ylab='Salary',xlab='Experience (stdized)',ylim=ylim,main='Education: hsd or hsg')
+points(elevels,m[,2,'hsd or hsg'],col=2,pch=2)
+legend('topleft',c('Male','Female'),col=c(1,2),pch=c(1,2))
+
+plot(elevels,m[,1,'sc'],ylab='Salary',xlab='Experience (stdized)',ylim=ylim,main='Education: some college')
+points(elevels,m[,2,'sc'],col=2,pch=2)
+legend('topleft',c('Male','Female'),col=c(1,2),pch=c(1,2))
+
+plot(elevels,m[,1,'cg'],ylab='Salary',xlab='Experience (stdized)',ylim=ylim,main='Education: college graduate')
+points(elevels,m[,2,'cg'],col=2,pch=2)
+legend('topleft',c('Male','Female'),col=c(1,2),pch=c(1,2))
+
+plot(elevels,m[,1,'ad'],ylab='Salary',xlab='Experience (stdized)',ylim=ylim,main='Education: advanced degree')
+points(elevels,m[,2,'ad'],col=2,pch=2)
+legend('topright',c('Male','Female'),col=c(1,2),pch=c(1,2))
+```
+
+
+
+# MLE and cross-validation
+
+We fit the full model regressing `y` on `x` via least squares.
+
+```{r}
+fit.mle= lm(y ~ x[,-1]) #1st column in x is the intercept, already added by lm
+b.mle= coef(fit.mle)
+summary(fit.mle)
+```
+
+## Predictive accuracy
+
+The multiple R-squared (unadjusted) reported above is the squared correlation between `y` and OLS predictions $\hat{y}$: it is an *in-sample* measure.
+```{r}
+cor(fit.mle$fitted.values,y)^2
+```
+
+To assess the OLS predictive accuracy we use 10-fold cross-validation implemented in function `kfoldCV.mle` in `routines_seminar1.R` copied below. 
+
+Remarks: The first column in `x` has all entries equal to 1 (the intercept), `kfoldCV.mle` expects a matrix with no intercept (i.e. `x[,-1]`). `seed=1` sets the random number generator seed (so we all use the same random splits).
+
+````markdown
+`r ''`
+kfoldCV.mle <- function(y,x,K=10,seed) {
+## Perform K-fold cross-validation for least-squares regression estimate
+## Input
+## - y: response
+## - x: data.frame with predictors, intercept should not be present
+## - K: number of folds in K-fold cross-validation
+## - seed: random number generator seed (optional)
+## Output
+## - pred: cross-validated predictions for y
+## - ssr: residual sum of squares, sum((y-pred)^2)
+  if (!missing(seed)) set.seed(seed)
+  subset <- rep(1:K,ceiling(nrow(x)/K))[1:nrow(x)]
+  subset <- sample(subset,size=nrow(x),replace=FALSE)
+  pred <- double(nrow(x))
+  if (ncol(x)>0) {
+    for (k in 1:K) {
+      sel <- subset==k
+      fit <- lm(y[!sel] ~ ., data=x[!sel,,drop=FALSE])
+      pred[sel] <- predict(fit, newdata=x[sel,,drop=FALSE])
+    }
+  } else {
+    for (k in 1:K) {
+      sel <- subset==k
+      pred[sel] <- mean(y[!sel],na.rm=TRUE)
+    }
+  }
+  return(list(pred=pred,ssr=sum((pred-y)^2,na.rm=TRUE)))
+}
+````
+We use `kfoldCV.mle` to obtain a 10-fold cross-validated $R^2$ (squared correlation between `y` and cross-validated predictions).
+
+```{r}
+cv.mle= kfoldCV.mle(y=y,x=data.frame(x[,-1]),K=10,seed=1)
+r2.mle= cor(cv.mle$pred, y)^2
+r2.mle
+```
+# LASSO
+
+## Setting penalization parameter $\lambda$
+
+### Via cross-validation
+We use function `cv.glmnet` to estimate $\lambda$ via 10-fold cross-validation. `glmnet` automatically includes the intercept, hence we use `x[,-1]` to exclude the first column from `x` (that containing the intercept).
+
+```{r}
+fit.lasso= cv.glmnet(x=x[,-1], y=y, nfolds=10)
+fit.lasso
+```
+
+We plot the estimated mean squared prediction error $\widehat{MSPE}$. Since $\widehat{MSPE}$ is a data-based estimate, also plots their standard errors. 
+
+```{r}
+plot(fit.lasso)
+```
+
+We can check how many values of $\lambda$ were assessed, and the value deemed to be optimal according to cross-validation. We can also plot the estimated $\hat{\beta}_\lambda$ for all considered $\lambda$.
+```{r}
+length(fit.lasso$lambda)
+fit.lasso$lambda.min
+```
+
+```{r}
+plot(fit.lasso$glmnet.fit, xvar='lambda')
+```
+
+We retrieve the estimated coefficients $\hat{\beta}_{\hat{\lambda}}$ with the `coef` function. The argument `s='lambda.min'` indicates to set $\hat{\lambda}$ to the value minimizing $\widehat{MSPE}$. Somewhat strangely, by default `coef` uses $\hat{\lambda}_{1SE}= \hat{\lambda} + \mbox{SE} \hat{\lambda}$.
+```{r}
+b.lasso= as.vector(coef(fit.lasso, s='lambda.min'))
+round(b.lasso, 3)
+```
+
+How many coefficients are set to a non-zero value in $\hat{\beta}_{\hat{\lambda}}$?
+What variables are selected? Do they suggest interactions between gender and other variables?
+
+```{r}
+#add your code here
+```
+
+### Via BIC and Extended BIC (EBIC)
+
+We repeat the analyses for LASSO setting $\lambda$ via BIC. We use functions `lasso.bic` from `routines_seminar1.R`
+
+````markdown
+`r ''`
+lasso.bic <- function(y,x,extended=FALSE) {
+  #Select model in LASSO path with best BIC (using LASSO regression estimates)
+  #Input
+  # - y: vector with response variable
+  # - x: design matrix
+  #
+  #Output: list with the following elements
+  # - coef: LASSO-estimated regression coefficient with lambda set via BIC
+  # - ypred: predicted y
+  # - lambda.opt: optimal value of lambda
+  # - lambda: data.frame with bic and number of selected variables for each value of lambda
+  require(glmnet)
+  fit <- glmnet(x=x,y=y,family='gaussian',alpha=1)
+  pred <- cbind(1,x) %*% rbind(fit$a0,fit$beta)
+  n <- length(y)
+  p <- colSums(fit$beta!=0) + 1
+  if (!extended){
+    bic <- n * log(colSums((y-pred)^2)/length(y)) + n*(log(2*pi)+1) + log(n)*p 
+  } else {
+    bic <- n * log(colSums((y-pred)^2)/length(y)) + n*(log(2*pi)+1) + log(n)*p + 2*log(choose(ncol(x),p))
+  }
+  sel <- which.min(bic)
+  beta <- c(fit$a0[sel],fit$beta[,sel]); names(beta)[1]= 'Intercept'
+  ypred <- pred[,sel]
+  ans <- list(coef=beta,ypred=ypred,lambda.opt=fit$lambda[sel],lambda=data.frame(lambda=fit$lambda,bic=bic,nvars=p))
+  return(ans)
+}
+````
+To use the BIC criteria, we set `extended=FALSE`.
+```{r}
+fit.lassobic= lasso.bic(y=y,x=x[,-1],extended = FALSE)
+b.lassobic= fit.lassobic$coef
+names(fit.lassobic)
+```
+
+To use the EBIC criteria, we set `extended=TRUE`.
+```{r}
+fit.lassoebic= lasso.bic(y=y,x=x[,-1],extended = TRUE)
+b.lassoebic= fit.lassoebic$coef
+names(fit.lassoebic)
+```
+
+Is the value of $\lambda$ chosen by BIC larger or smaller than for cross-validation?
+
+```{r}
+#add your code here
+```
+
+How many coefficients are set to a non-zero value in $\hat{\beta}_{\hat{\lambda}}$?
+Are the selected variables different from those selected with $\lambda$ set by cross-validation?
+Does your interpretation regarding gender imbalances change?
+
+```{r}
+#add your code here
+```
+
+
+## Cross-validated $R^2$
+
+### $\lambda$ set via cross-validation
+
+Unfortunately `cv.glmnet` does not return the out-of-sample predictions $\hat{y}$, just their mean squared prediction error. To obtain cross-validated predictions, and assess their cross-validated $R^2$ with the observed outcome, we use `kfoldCV.lasso` in `routines_seminar1.R`.
+
+```{r}
+cv.lasso= kfoldCV.lasso(y=y,x=x[,-1],K=10,seed=1,criterion="cv")
+r2.lassocv= cor(y,cv.lasso$pred)^2
+r2.lassocv
+```
+
+Does it deviate much from the $R^2$ different to that from OLS? Can you explain why?
+
+```{r}
+#add your answer here
+```
+
+
+### $\lambda$ set via BIC and EBIC
+
+Again to obtain cross-validated predictions and $R^2$, we use `kfoldCV.lasso` in `routines.R` (in the latter we now set `criterion="bic"` or `criterion="ebic"`)
+
+```{r}
+cv.lassobic= kfoldCV.lasso(y=y,x=x[,-1],K=10,seed=1,criterion="bic")
+r2.lassobic= cor(y,cv.lassobic$pred)^2
+r2.lassobic
+```
+
+How does the predictive ability compare between the different methods to set $\lambda$?
+
+```{r}
+#add your code and analysis here
+```
+
+
+# Ridge
+
+## Setting penalization parameter $\lambda$
+
+To set $\lambda$ by cross-validation we use the function `cv.glmnet` again but this time setting parameter `alpha` to 0. Indeed, the objective function optimized in `glmnet` uses an elastic-net penalty which mixes $L_1$ and  $L_2$ penalties as follows:
+
+$$\min _{\left(\beta_{0}, \beta\right) \in \mathbb{R}^{p+1}} \frac{1}{2 N} \sum_{i=1}^{N}\left(y_{i}-\beta_{0}-x_{i}^{T} \beta\right)^{2}+\lambda\left[(1-\alpha)\|\beta\|_{2}^{2} / 2+\alpha\|\beta\|_{1}\right]$$
+where $\lambda$ is the penalization parameter and $\alpha$ is a mixing parameter. When $\alpha$ is 1 (default), `cv.glmnet` fits a LASSO, when $\alpha$ is 0, `cv.glmnet` fits a Ridge regression.
+
+```{r}
+fit.ridge= cv.glmnet(x=x[,-1], y=y, alpha = 0, nfolds=10)
+fit.ridge
+```
+
+We plot the estimated mean squared prediction error $\widehat{MSPE}$ as a function of $\lambda$.
+
+```{r}
+plot(fit.ridge)
+```
+
+We plot the cofficient path and see that, this time, all estimated coefficients shrink as $\lambda$ grows but remain non-zero.   
+
+```{r}
+plot(fit.ridge$glmnet.fit, xvar='lambda')
+```
+
+```{r}
+b.ridge= as.vector(coef(fit.ridge, s='lambda.min'))
+round(b.ridge, 3)
+```
+
+Can we use the BIC and EBIC criteria as presented in the course notes to choose $\lambda$?
+
+```{r}
+#add your code and analysis here
+```
+
+We see in that in the plot of $\widehat{MSPE}$ as a function of $\lambda$, the optimal  $\lambda$ is the smallest one. Actually, if we extend the window to smaller values, cross-validation keeps selecting the smallest value. The best solution, predicting accuracy wise, is no $L_2$ penalization at all. This illustrates the optimality of MLE for large $n$.
+
+
+## Cross-validated $R^2$
+
+We compute a cross-validated $R^2$ with the function `kfoldCV.ridge` from `routines_seminar1.R`, and adaptation of `kfoldCV.lasso` to Ridge regression.
+
+```{r}
+cv.ridge= kfoldCV.ridge(y=y,x=x[,-1],K=10,seed=1,criterion="cv")
+r2.ridgecv= cor(y,cv.ridge$pred)^2
+r2.ridgecv
+```
+
+# Understanding differences between OLS vs LASSO vs Ridge
+
+It is interesting to compare the point estimates given by OLS vs LASSO and OLS vs Ridge. Just for fun we mark the coefficients with OLS P-value<0.05 in red.
+
+```{r}
+bols= summary(fit.mle)$coef
+pvalue= round(bols[,4],4)
+col= ifelse(pvalue < 0.05,'red','black')
+
+data.frame(mle= coef(fit.mle)[-1], lassobic= b.lassobic[-1]) %>% 
+  ggplot(aes(x=mle,y=lassobic)) + 
+  geom_point(col = col[-1],shape = "O",size=2) +
+  geom_abline(slope=1, intercept = 0, linetype = 'dashed') +
+  geom_hline(yintercept = 0, linetype = 'dotted') +
+  xlab('OLS') +
+  ylab('LASSO (Lambda BIC)') +
+  coord_cartesian(xlim=c(-2,0.5),ylim=c(-2,0.5)) +
+  theme_classic()
+
+```
+
+```{r}
+data.frame(mle= coef(fit.mle)[-1], ridgebic= b.ridge[-1]) %>%
+  ggplot(aes(x=mle,y=ridgebic)) +
+  geom_point(col = col[-1],shape = "O",size=2) +
+  geom_abline(slope=1, intercept = 0, linetype = 'dashed') +
+  geom_hline(yintercept = 0, linetype = 'dotted') +
+  xlab('OLS') +
+  ylab('Ridge (Lambda CV)') +
+  coord_cartesian(xlim=c(-2,0.5),ylim=c(-2,0.5)) +
+  theme_classic()
+
+```
+
+What do you observe?
+
+```{r}
+#add your code and analysis here
+```
+
+# Small $n$, large $p$
+
+When $p$ is large in comparison to $n$, MLE estimator variance can be very large due to estimating too many parameters. When $p$ is larger than $n$, OLS fails.
+
+The Vessel dataset originates from a study on the possibilty to determine the chemical composition of a set of glass vessels from an archaeological site by spectrometric analysis. 180 vessels were sampled and submitted to X-ray spectrometry on 1920 frequencies. The content of 13 chemical compounds ($Na_2O$, $MgO$, $Al_2O_3$, $SiO_2$, $P_2O_5$, $SO_3$, $Cl$, $K_2O$, $CaO$, $MnO$, $F_2O_3$, $BaO$, $PbO$) in the samples was also measured. We will predict the content of compound 1 (sodium oxide) from the 1920 frequencies.
+
+
+We load the data, log transform the frequency data, rename the columns
+```{r}
+data_logx <- log(read_csv(file.path(PATH, "data/Vessel_X.txt"), col_names = FALSE))
+data_y <- read_csv(file.path(PATH, "data/Vessel_Y.txt"), col_names = FALSE)
+data_y <- data_y[,1]
+colnames(data_logx)<-sprintf("%s%i","F",seq(100,400,1))
+colnames(data_y)<-sprintf("%s%i","Y",seq(1,ncol(data_y)))
+data<-cbind(data_logx,data_y)
+```
+```{r}
+df <- data.frame(frequency = seq(100,400,1), mean = colMeans(data_logx), variance = diag(cov(data_logx)))
+p1 <- ggplot(df)+geom_line(aes(y=mean,x=frequency)) + geom_vline(xintercept = c(102, 120, 144, 194, 228, 253, 319, 355,385),col="grey")
+# p2 <- ggplot(df)+geom_line(aes(y=variance,x=frequency))+geom_vline(xintercept = c(102, 120, 144, 194, 228, 253, 319, 355,385),col="grey")
+```
+
+A look at the frequency data shows us that predictors are highly correlated.
+
+```{r, include=TRUE,fig.cap="\\label{fig:fig1} Mean response by frequency",out.extra = "", fig.pos = 'h!', fig.align="center"}
+p1
+# grid.arrange(p1, p2, ncol=2)
+```
+
+We can plot how the frequency profile changes for vessels with the largest and lowest content in sodium oxide to try to identify good predictors.
+
+```{r}
+low<-data %>% 
+  dplyr::arrange(Y1) %>% 
+  dplyr::slice(1:15) %>% 
+  dplyr::select(-Y1) %>% 
+  summarise_all(median)
+
+high<-data %>% 
+  dplyr::arrange(Y1) %>%
+  dplyr::slice((n()-15):n()) %>% 
+  dplyr::select(-Y1) %>% 
+  summarise_all(median)
+
+df<-data.frame(frecuencia = seq(100,400,1), bajo = as.numeric(low), alto = as.numeric(high))
+```
+
+
+```{r, include=TRUE,fig.cap="\\label{fig:fig2} Median response for the 15 vessels with the largest and lowest content in sodium oxide",out.extra = "", fig.pos = 'h!', fig.align="center"}
+ggplot(df,aes(x=frecuencia)) + 
+  geom_line(aes(y=bajo,col="lowest")) + 
+  geom_line(aes(y=alto,col="largest")) +
+  ylab("Median") +
+  xlab("Frequency") +
+  labs(color="Content") +
+  theme(plot.title = element_text(size = 10, face = "bold"),
+        legend.position="bottom",
+        legend.title = element_text(size = 10)) +
+  geom_vline(xintercept = c(100, 120, 145, 194, 253, 319, 355, 385),col="grey")
+
+```
+
+If we try to fit an OLS:
+
+```{r}
+mle_vessel <- lm(Y1~., data = data)
+summary(mle_vessel)
+```
+
+Let's say that we managed to reduce our set of potential predictors to 150 variables, and we fit an OLS:
+
+```{r}
+mle_vessel <- lm(Y1~., data = data[,(302-150):302])
+summary(mle_vessel)
+```
+
+The fit has little predictive accuracy. Multicollinearity generates multiple issues numerically and statistically (but no bias).
+
+```{r}
+cv.mle= kfoldCV.mle(y=data$Y1,x=data[,(302-150):301],K=10,seed=1)
+r2.mle= cor(cv.mle$pred, data$Y1)^2
+r2.mle
+```
+
+Now we fit the LASSO. Out of the 301 frequencies, the LASSO selects 31 of them.
+
+```{r}
+fit.lasso= cv.glmnet(x=as.matrix(data_logx), y=data_y$Y1, nfolds=10)
+fit.lasso
+```
+
+```{r}
+b.lasso <- as.vector(coef(fit.lasso, s='lambda.min'))
+names(b.lasso) <- c('intercept',colnames(data_logx))
+b.lasso[b.lasso!=0]
+```
+The predictive accuracy is very high with just 31 predictors.
+
+```{r}
+cv.lassobic= kfoldCV.lasso(x=as.matrix(data_logx), y=data_y$Y1,K=10,seed=1,criterion="cv")
+r2.lassobic= cor(data_y$Y1,cv.lassobic$pred)^2
+r2.lassobic
+```
+
+```{r}
+fit.lasso= cv.glmnet(x=as.matrix(data_logx[,(301-149):30]), y=data_y$Y1, nfolds=10)
+cv.lassobic= kfoldCV.lasso(x=as.matrix(data_logx[,(301-149):30]), y=data_y$Y1,K=10,seed=1,criterion="cv")
+r2.lassobic= cor(data_y$Y1,cv.lassobic$pred)^2
+r2.lassobic
+```
+
+The Ridge regression outputs nonzero coefficients for all the 301 frequencies...
+
+```{r}
+fit.ridge= cv.glmnet(x=as.matrix(data_logx), y=data_y$Y1, alpha = 0, nfolds=10)
+fit.ridge
+```
+
+```{r}
+b.rigde <- as.vector(coef(fit.ridge, s='lambda.min'))
+names(b.rigde) <- c('intercept',colnames(data_logx))
+length(b.rigde[b.rigde!=0])
+```
+... and achieves a lowest predictive accuracy.
+
+```{r}
+cv.ridge= kfoldCV.ridge(x=as.matrix(data_logx), y=data_y$Y1,K=10,seed=1,criterion="cv")
+r2.ridgecv= cor(data_y$Y1,cv.ridge$pred)^2
+r2.ridgecv
+```
+What happens when predictors are highly correlated is that the Ridge penalty shrinks the coefficients of correlated predictors towards each other while the LASSO tends to pick one of them and discard the others. 
+
+```{r}
+b.ridge
+```
+
+
+# Inference for LASSO
+
+We illustrate here the discussion on inference with penalized likelihood methods in the case of LASSO and with simulated data. Function `simdata.cs` generates, for each of `n` independent individuals, `p` covariates that are normally-distributed with mean 0, variance 1, and all pairwise correlations equal to `rho`.
+
+We set `n=100`, `p=200`, `rho=0.5`. The true value of all regression coefficients is 0, except for the last four. You're encouraged to play around and explore how the results vary as one has different n, p, rho or regression coefficients. 
+
+```{r}
+n= 100  # No. observations
+p= 200  # No. features
+rho= 0.5  # True pairwise correlation across features
+beta= c(rep(0, p - 4), -2/3, 1/3, 2/3, 1)
+
+# Simulate data
+sim.data= simdata.cs(seed = 2, n, beta, phi = 1, rho)
+X= sim.data[['x']]  # covariates
+y= sim.data[['y']]  # response
+```
+
+## LASSO + naive OLS
+
+We first run a two-step analysis strategy that is simple but not quite correct. In Step 1 we use `glmnet` to select variables via LASSO, setting the penalization parameter $\lambda$ via cross-validation.
+
+```{r}
+# Standardise (relevant for glmnet function)
+Xstd= scale(X)
+ystd= scale(y)
+colnames(Xstd)= paste('X', 1:ncol(Xstd), sep = '')
+
+set.seed(123456)
+lambda= cv.glmnet(x = Xstd, y = ystd, nfolds = 10)[['lambda.min']]
+gfit= glmnet(x = Xstd, y = ystd, standardize = FALSE, lambda = lambda)
+b.lasso= coef(gfit)[-1] #estimated coefficients
+sel.lasso= (b.lasso != 0)
+sum(sel.lasso) #number of selected covariates
+```
+
+In Step 2 we fit a linear model using the variables selected in Step 1 via ordinary least-squares (R function `lm`). We display the first few estimated coefficients, confidence intervals and P-values. 
+
+```{r}
+lm.afterlasso= lm(y ~ -1 + X[, sel.lasso])
+ci.lasso= matrix(0, nrow = p, ncol = 4)
+colnames(ci.lasso) = c('estimate','ci_low','ci_upp', 'p_value')
+rownames(ci.lasso) = paste("X",1:ncol(X),sep="")
+ci.lasso[sel.lasso, 1:3] = cbind(coef(lm.afterlasso), confint(lm.afterlasso))
+ci.lasso[sel.lasso, 4]= summary(lm.afterlasso)$coef[,4]
+ci.lasso[!sel.lasso,4]= NA
+```
+
+We round estimates to 3 decimals and P-values to 4 decimals, and display the output for the variables for which the LASSO estimate was non-zero.
+
+```{r}
+ci.lasso[,1:3]= round(ci.lasso[,1:3], 3)  
+ci.lasso[,4]= round(ci.lasso[,4], 4)      
+ci.lasso[sel.lasso, ]
+```
+We compare the selected variables with the simulation truth. The cross-tabulation table below counts the number of true positives, false positives and false negatives.
+
+```{r}
+sel.lasso= rep(FALSE, nrow(ci.lasso))
+sel.lasso[ci.lasso[,4] < 0.05]= TRUE
+table(sel.lasso, beta != 0)
+```
+
+Finally we plot the confidence intervals, along with the true parameter values. Intervals that do not contain the true value are plotted in red.
+
+```{r}
+cols= ifelse(beta < ci.lasso[, 2] | beta > ci.lasso[, 3], 2, 1)
+plot(1:p, beta, ylim=1.25*range(ci.lasso[,1:3]), xlim=c(0,nrow(ci.lasso)), ylab='95%CI', xlab='', main='Naive LASSO + OLS')
+segments(y0 = ci.lasso[, 2], y1 = ci.lasso[, 3], x0 = 1:nrow(ci.lasso), col = cols)
+points(1:p, beta, pch = 16)
+```
+
+## LASSO + post-selection inference (Lee et al, 2016, AOS)
+
+We now run LASSO followed by post-selection inference. The main advantage of this strategy is that there are some theoretical guarantees that the obtained CI's have the correct coverage (i.e. we expect them to contain the true regression coefficients 95% of the time).
+
+We use function `lassopost`. This is a wrapper function created to make your life easier, it calls several functions from package `selectiveInference` and returns the CI's.
+
+We display the point estimates and post-selection adjusted 95\% CI's and P-values (rounded to 4 decimal places). Notice that the set of variables with non-zero LASSO point-estimate differs from our earlier LASSO run. The reason is that the regularization parameter $\lambda$ is set via 10-fold cross-validation, hence running cross-validation multiple times returns different $\lambda$'s and in turn different $\hat{\beta}$'s. 
+
+```{r}
+ci.lassopost= lassopost(y, X, method.lambda='cv')
+round(ci.lassopost[ci.lassopost[,1] != 0,], 4)
+```
+
+A better alternative is to set $\lambda$ via the BIC, which typically does a better job at identifying the set of variables that truly have an effect.
+
+```{r}
+ci.lassopost= lassopost(y, X, method.lambda='bic')
+round(ci.lassopost[ci.lassopost[,1] != 0,], 4)
+```
+
+We tabulate number of true positives, false positives and false negatives.
+
+```{r}
+sel.lassopost= rep(FALSE, nrow(ci.lassopost))
+sel.lassopost[ci.lassopost[,4] < 0.05]= TRUE
+table(sel.lassopost, beta != 0)
+```
+
+We plot the CIs as we did in 5.1. Notice that now intervals do a better job at including the true value, this is because they're generally wider, however this also means it is harder to pick up variables that truly have an effect. 
+
+```{r}
+plot(NA, ylim=1.25*range(ci.lasso[,1:3]), xlim=c(0,nrow(ci.lassopost)), ylab='95% CI', xlab='', main='LASSO + PoSI')
+grid()
+cols= ifelse(beta < ci.lassopost[, 2] | beta > ci.lassopost[, 3], 2, 1)
+segments(y0 = ci.lassopost[, 2], y1 = ci.lassopost[, 3], x0 = 1:nrow(ci.lassopost), col = cols)
+points(1:p, beta, pch = 16)
+```
+
+
+## Bootstrap LASSO
+
+We now obtain confidence intervals for LASSO parameters by bootstrap with the funcion `bootLasso` from the package `HDCI`. The parameter `B` controls the number of iterations of bootstrap, `type.boot` controls the choice of method between residual bootstap and paired bootstrap and `alpha` the desired coverage.
+
+```{r}
+bootlasso <- bootLasso(X, y, B = 500, type.boot = "paired", alpha = 0.05)
+```
+
+```{r}
+ci.bootlasso <- t(bootlasso$interval)
+df <- data.frame(sprintf("X%s",seq(1:ncol(X))),bootlasso$Beta,ci.bootlasso)
+colnames(df) <- c('variable','estimate','ci.low','ci.up')
+df[df$estimate != 0,]
+```
+
+We tabulate the number of true positives, false positives and false negatives.
+
+```{r}
+sel.bootlasso= rep(TRUE, nrow(df))
+sel.bootlasso[(0 >= df$ci.low) & (0 <= df$ci.up)] <- FALSE
+table(sel.bootlasso, beta != 0)
+```
+
+We plot the CIs as we did in 5.1.
+
+```{r}
+plot(NA, ylim=1.25*range(ci.lasso[,1:3]), xlim=c(0,nrow(ci.bootlasso)), ylab='95% CI', xlab='', main='Bootstrap LASSO')
+cols= ifelse(beta < ci.bootlasso[, 1] | beta > ci.bootlasso[, 2], 2, 1)
+segments(y0 = ci.bootlasso[, 1], y1 = ci.bootlasso[, 2], x0 = 1:nrow(ci.bootlasso), col = cols)
+points(1:p, beta, pch = 16)
+```
+
+# Homework (to be turned in)
+
+In this lab we have implemented LASSO for Gaussian linear regression but LASSO can also be used for GLMs. In this homework, you will implement LASSO for logistic regression (GLM for Bernoulli response) on the spam dataset with `glmnet`. Check `help("glmnet")` and the package vignette for further information.
+
+The spam dataset consists of information from 4601 email messages, in a study to try to predict whether the email was junk email, or “spam.” The objective was to design an automatic spam detector that could filter out spam before clogging the users’ mailboxes. For all 4601 email messages, the true outcome (email type) email or spam is available, along with the relative frequencies of 57 of the most commonly occurring words and punctuation marks in the email message.
+
+The file `spam.info.txt` contains information about the dataset, `spambase.names` the names of the variables  and `spam.data` the actual data. The last column of `spam.data` denotes whether the e-mail was 
+considered spam (1) or not (0). The data can be loaded with the following code:
+
+```{r}
+spam <- read.table(file.path(PATH, 'data/spam.data'), quote="\"", comment.char="")
+spam.names <- c(read.table("data/spambase.names", sep = ":", skip = 33, nrows = 53, as.is = TRUE)[,
+1], "char_freq_#", read.table("data/spambase.names", sep = ":", skip = 87, nrows = 3,
+as.is = TRUE)[, 1], "spam.01")
+names(spam) <- spam.names
+spam <- spam[sample(nrow(spam)),]
+```
+
+Compare MLE, LASSO-CV and LASSO-BIC estimates in a 1 page report indicating the number of selected variables and 10-fold cross-validated $R^2$ for each of these 3 methods. Include the R code you used and a discussion on the following question: if you were asked to choose one of these methods to obtain results for your applied research paper, which one would you pick, and why?
